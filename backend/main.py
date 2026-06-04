@@ -1,222 +1,112 @@
-"""
-EdgeSphere AI - Enterprise IoT Device Management Platform
-Main Application Entry Point
-"""
-
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+﻿from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from contextlib import asynccontextmanager
-import logging
+from pydantic import BaseModel
 from typing import Dict, List, Optional
-import asyncio
+from datetime import datetime
+import random
 
-from api.routes import devices, analytics, ota, fleet, ai
-from services.mqtt_service import MQTTService
-from services.kafka_service import KafkaService
-from services.ai_anomaly_detector import AIAnomalyDetector
-from services.predictive_maintenance import PredictiveMaintenanceEngine
-from database.connection import DatabaseConnection
-from models.device import Device
-from core.config import settings
-from core.security import SecurityManager
-from core.telemetry import TelemetryCollector
+app = FastAPI(title="EdgeSphere AI", version="1.0.0")
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-# Global service instances
-mqtt_service = None
-kafka_service = None
-anomaly_detector = None
-pm_engine = None
-security_manager = None
-telemetry_collector = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage application lifecycle"""
-    global mqtt_service, kafka_service, anomaly_detector, pm_engine
-    
-    # Startup
-    logger.info("Starting EdgeSphere AI Platform...")
-    
-    # Initialize database
-    await DatabaseConnection.initialize()
-    
-    # Initialize security manager
-    security_manager = SecurityManager()
-    
-    # Initialize MQTT service
-    mqtt_service = MQTTService(security_manager)
-    await mqtt_service.connect()
-    
-    # Initialize Kafka service
-    kafka_service = KafkaService()
-    await kafka_service.start()
-    
-    # Initialize AI services
-    anomaly_detector = AIAnomalyDetector()
-    pm_engine = PredictiveMaintenanceEngine()
-    
-    # Initialize telemetry collector
-    telemetry_collector = TelemetryCollector()
-    
-    # Start background tasks
-    asyncio.create_task(process_telemetry_stream())
-    asyncio.create_task(monitor_device_health())
-    
-    logger.info("EdgeSphere AI Platform started successfully")
-    
-    yield
-    
-    # Shutdown
-    logger.info("Shutting down EdgeSphere AI Platform...")
-    await mqtt_service.disconnect()
-    await kafka_service.stop()
-    await DatabaseConnection.close()
-
-# Create FastAPI app
-app = FastAPI(
-    title="EdgeSphere AI",
-    description="Enterprise IoT Device Management Platform",
-    version="1.0.0",
-    lifespan=lifespan
-)
-
-# Add middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.ALLOWED_HOSTS)
+# Data models
+class Device(BaseModel):
+    device_id: str
+    device_type: str
+    status: str
+    firmware_version: str
+    last_seen: str
+    location: Optional[str] = None
 
-# Include routers
-app.include_router(devices.router, prefix="/api/v1/devices", tags=["devices"])
-app.include_router(analytics.router, prefix="/api/v1/analytics", tags=["analytics"])
-app.include_router(ota.router, prefix="/api/v1/ota", tags=["ota"])
-app.include_router(fleet.router, prefix="/api/v1/fleet", tags=["fleet"])
-app.include_router(ai.router, prefix="/api/v1/ai", tags=["ai"])
+class Telemetry(BaseModel):
+    device_id: str
+    temperature: float
+    humidity: float
+    vibration: float
+    cpu_usage: float
+    timestamp: str
+
+# In-memory storage
+devices_db = {}
+telemetry_db = {}
+anomalies_db = []
 
 @app.get("/")
 async def root():
-    return {
-        "name": "EdgeSphere AI",
-        "version": "1.0.0",
-        "status": "operational",
-        "capabilities": [
-            "device_fleet_management",
-            "ai_anomaly_detection",
-            "predictive_maintenance",
-            "ota_updates",
-            "real_time_telemetry"
-        ]
-    }
+    return {"message": "EdgeSphere AI API", "status": "operational", "version": "1.0.0"}
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    health_status = {
-        "status": "healthy",
-        "services": {
-            "database": await DatabaseConnection.health_check(),
-            "mqtt": mqtt_service.is_connected(),
-            "kafka": kafka_service.is_healthy()
+async def health():
+    return {"status": "healthy", "timestamp": datetime.now().isoformat()}
+
+@app.post("/api/v1/devices/register")
+async def register_device(device: Device):
+    device.last_seen = datetime.now().isoformat()
+    devices_db[device.device_id] = device.dict()
+    return {"message": "Device registered", "device_id": device.device_id}
+
+@app.get("/api/v1/devices")
+async def get_devices():
+    return list(devices_db.values())
+
+@app.get("/api/v1/devices/{device_id}")
+async def get_device(device_id: str):
+    if device_id not in devices_db:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return devices_db[device_id]
+
+@app.post("/api/v1/telemetry")
+async def receive_telemetry(telemetry: Telemetry):
+    if telemetry.device_id not in telemetry_db:
+        telemetry_db[telemetry.device_id] = []
+    
+    telemetry_db[telemetry.device_id].append(telemetry.dict())
+    
+    # Anomaly detection
+    if telemetry.temperature > 50 or telemetry.vibration > 5:
+        anomaly = {
+            "device_id": telemetry.device_id,
+            "type": "critical" if telemetry.temperature > 70 else "warning",
+            "message": f"High {'temperature' if telemetry.temperature > 50 else 'vibration'} detected",
+            "value": telemetry.temperature if telemetry.temperature > 50 else telemetry.vibration,
+            "timestamp": datetime.now().isoformat()
         }
+        anomalies_db.append(anomaly)
+        
+    # Update device last seen
+    if telemetry.device_id in devices_db:
+        devices_db[telemetry.device_id]["last_seen"] = datetime.now().isoformat()
+    
+    return {"message": "Telemetry received", "anomaly_detected": telemetry.temperature > 50 or telemetry.vibration > 5}
+
+@app.get("/api/v1/telemetry/{device_id}")
+async def get_telemetry(device_id: str, limit: int = 100):
+    if device_id not in telemetry_db:
+        return []
+    return telemetry_db[device_id][-limit:]
+
+@app.get("/api/v1/anomalies")
+async def get_anomalies():
+    return anomalies_db
+
+@app.get("/api/v1/stats")
+async def get_stats():
+    return {
+        "total_devices": len(devices_db),
+        "online_devices": sum(1 for d in devices_db.values() if d.get("status") == "online"),
+        "total_telemetry": sum(len(t) for t in telemetry_db.values()),
+        "anomalies_count": len(anomalies_db)
     }
-    
-    if not all(health_status["services"].values()):
-        raise HTTPException(status_code=503, detail="Service unhealthy")
-    
-    return health_status
-
-async def process_telemetry_stream():
-    """Background task to process telemetry data"""
-    while True:
-        try:
-            message = await kafka_service.consume("device_telemetry")
-            if message:
-                # Process anomaly detection
-                anomaly = await anomaly_detector.detect(message)
-                if anomaly:
-                    await handle_anomaly(message, anomaly)
-                
-                # Update predictive maintenance models
-                await pm_engine.update_model(message)
-                
-                # Store telemetry
-                await telemetry_collector.store(message)
-                
-        except Exception as e:
-            logger.error(f"Error processing telemetry: {e}")
-            await asyncio.sleep(1)
-
-async def monitor_device_health():
-    """Monitor device health and trigger alerts"""
-    while True:
-        try:
-            devices = await Device.get_all_active()
-            for device in devices:
-                health_score = await pm_engine.get_device_health(device.id)
-                if health_score < settings.HEALTH_THRESHOLD:
-                    await trigger_health_alert(device, health_score)
-            
-            await asyncio.sleep(60)  # Check every minute
-            
-        except Exception as e:
-            logger.error(f"Health monitoring error: {e}")
-            await asyncio.sleep(5)
-
-async def handle_anomaly(telemetry: Dict, anomaly: Dict):
-    """Handle detected anomalies"""
-    logger.warning(f"Anomaly detected: {anomaly}")
-    
-    # Store anomaly
-    await telemetry_collector.store_anomaly(anomaly)
-    
-    # Trigger alerts
-    if anomaly["severity"] == "critical":
-        await send_critical_alert(anomaly)
-    
-    # Update dashboard via WebSocket
-    await notify_dashboard("anomaly", anomaly)
-
-async def trigger_health_alert(device: Device, health_score: float):
-    """Trigger device health alerts"""
-    alert = {
-        "device_id": device.id,
-        "health_score": health_score,
-        "threshold": settings.HEALTH_THRESHOLD,
-        "timestamp": datetime.utcnow().isoformat(),
-        "recommended_action": await pm_engine.get_recommendation(device.id)
-    }
-    
-    await notify_dashboard("health_alert", alert)
-
-async def notify_dashboard(event_type: str, data: Dict):
-    """Send real-time notifications to dashboard"""
-    # Implement WebSocket notification
-    pass
-
-async def send_critical_alert(anomaly: Dict):
-    """Send critical alerts via configured channels"""
-    # Implement email, SMS, webhook notifications
-    pass
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info"
-    )
+    print("🚀 EdgeSphere AI Backend Starting...")
+    print("📡 API available at: http://localhost:8000")
+    print("📖 API Docs: http://localhost:8000/docs")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
