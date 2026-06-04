@@ -1,0 +1,201 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edgesphere
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: edgesphere-secrets
+  namespace: edgesphere
+type: Opaque
+data:
+  db-password: <base64-encoded-password>
+  mqtt-password: <base64-encoded-mqtt-password>
+  secret-key: <base64-encoded-secret-key>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: edgesphere-config
+  namespace: edgesphere
+data:
+  app.env: "production"
+  mqtt.broker.host: "mqtt-service"
+  kafka.bootstrap.servers: "kafka-service:9092"
+  redis.host: "redis-service"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edgesphere-api
+  namespace: edgesphere
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: edgesphere-api
+  template:
+    metadata:
+      labels:
+        app: edgesphere-api
+    spec:
+      containers:
+      - name: api
+        image: edgesphere/api:latest
+        ports:
+        - containerPort: 8000
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: edgesphere-secrets
+              key: database-url
+        - name: MQTT_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: edgesphere-secrets
+              key: mqtt-password
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "500m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: edgesphere-ai-worker
+  namespace: edgesphere
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: edgesphere-ai
+  template:
+    metadata:
+      labels:
+        app: edgesphere-ai
+    spec:
+      containers:
+      - name: ai-worker
+        image: edgesphere/ai-worker:latest
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "1000m"
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        env:
+        - name: MODEL_PATH
+          value: "/models/anomaly_detection.h5"
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: model-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edgesphere-api
+  namespace: edgesphere
+spec:
+  selector:
+    app: edgesphere-api
+  ports:
+  - port: 8000
+    targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: edgesphere-dashboard
+  namespace: edgesphere
+spec:
+  selector:
+    app: edgesphere-dashboard
+  ports:
+  - port: 80
+    targetPort: 3000
+  type: LoadBalancer
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: edgesphere-api-hpa
+  namespace: edgesphere
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: edgesphere-api
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: edgesphere-ingress
+  namespace: edgesphere
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  tls:
+  - hosts:
+    - api.edgesphere.ai
+    - dashboard.edgesphere.ai
+    secretName: edgesphere-tls
+  rules:
+  - host: api.edgesphere.ai
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: edgesphere-api
+            port:
+              number: 8000
+  - host: dashboard.edgesphere.ai
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: edgesphere-dashboard
+            port:
+              number: 80

@@ -1,0 +1,149 @@
+name: EdgeSphere AI CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        cd backend
+        pip install -r requirements.txt
+        pip install pytest pytest-cov
+    
+    - name: Run backend tests
+      run: |
+        cd backend
+        pytest tests/ --cov=. --cov-report=xml
+    
+    - name: Set up Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '18'
+    
+    - name: Install frontend dependencies
+      run: |
+        cd web-dashboard
+        npm ci
+    
+    - name: Run frontend tests
+      run: |
+        cd web-dashboard
+        npm test -- --coverage
+    
+    - name: Upload coverage reports
+      uses: codecov/codecov-action@v3
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Log in to Container Registry
+      uses: docker/login-action@v2
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Build and push Backend image
+      uses: docker/build-push-action@v4
+      with:
+        context: ./backend
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/backend:latest
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/backend:${{ github.sha }}
+    
+    - name: Build and push Dashboard image
+      uses: docker/build-push-action@v4
+      with:
+        context: ./web-dashboard
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/dashboard:latest
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/dashboard:${{ github.sha }}
+    
+    - name: Build and push AI Worker image
+      uses: docker/build-push-action@v4
+      with:
+        context: ./backend
+        file: ./backend/Dockerfile.ai
+        push: true
+        tags: |
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ai-worker:latest
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ai-worker:${{ github.sha }}
+
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Configure kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'latest'
+    
+    - name: Set up Kubernetes config
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.STAGING_KUBE_CONFIG }}" | base64 --decode > $HOME/.kube/config
+    
+    - name: Deploy to staging
+      run: |
+        kubectl set image deployment/edgesphere-api api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/backend:${{ github.sha }} -n edgesphere-staging
+        kubectl set image deployment/edgesphere-dashboard dashboard=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/dashboard:${{ github.sha }} -n edgesphere-staging
+        kubectl rollout status deployment/edgesphere-api -n edgesphere-staging
+        kubectl rollout status deployment/edgesphere-dashboard -n edgesphere-staging
+
+  deploy-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Configure kubectl
+      uses: azure/setup-kubectl@v3
+    
+    - name: Set up Kubernetes config
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.PRODUCTION_KUBE_CONFIG }}" | base64 --decode > $HOME/.kube/config
+    
+    - name: Deploy to production
+      run: |
+        kubectl set image deployment/edgesphere-api api=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/backend:${{ github.sha }} -n edgesphere
+        kubectl set image deployment/edgesphere-dashboard dashboard=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/dashboard:${{ github.sha }} -n edgesphere
+        kubectl set image deployment/edgesphere-ai-worker ai-worker=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/ai-worker:${{ github.sha }} -n edgesphere
+        kubectl rollout status deployment/edgesphere-api -n edgesphere
+        kubectl rollout status deployment/edgesphere-dashboard -n edgesphere
+        kubectl rollout status deployment/edgesphere-ai-worker -n edgesphere
+    
+    - name: Verify deployment
+      run: |
+        curl -f https://api.edgesphere.ai/health
